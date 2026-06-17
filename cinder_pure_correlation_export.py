@@ -22,11 +22,7 @@
 #
 # ---------------------------------------------------------------------------
 # REQUIREMENTS
-#   python3 -m pip install 'openstacksdk>=0.103'
-#
-#   NOTE: cross-project volume listing via the `all_projects` query parameter
-#   requires a reasonably recent openstacksdk. On older releases the kwarg is
-#   silently ignored and only the authenticated project's volumes are returned.
+#   python3 -m pip install openstacksdk
 #
 # AUTHENTICATION
 #   Uses the standard openstacksdk auth chain. Either:
@@ -45,6 +41,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -60,11 +57,21 @@ except ImportError:
     sys.exit(2)
 
 
-# The Pure Storage Cinder driver names every backing volume as:
-#   volume-<openstack-volume-uuid>-cinder
-# These affixes are used to derive the FlashArray volume name from the
-# OpenStack UUID, and (in reverse) to parse a UUID out of an array volume name
-# during recovery.
+# The Pure Storage Cinder driver records the true backing-volume name in the
+# volume's metadata under this key. This is the authoritative source and is
+# used directly. The name is NOT constructed from the OpenStack volume id:
+# after a migration or retype the backing name no longer matches
+# volume-<id>-cinder, so any constructed value would be wrong.
+PURE_NAME_METADATA_KEY = "array_volume_name"
+
+# The driver also records which FlashArray the volume lives on, under this key.
+# Capturing it disambiguates the correlation in multi-backend deployments,
+# where the same volume name could otherwise exist on more than one array.
+PURE_ARRAY_METADATA_KEY = "array_name"
+
+# Used only by the offline --lookup reverse helper to parse a UUID back out of
+# an array volume name. Names look like 'volume-<uuid>-cinder', optionally with
+# a Purity pod/volume-group scope prefix ('mypod::volume-...').
 PURE_NAME_PREFIX = "volume-"
 PURE_NAME_SUFFIX = "-cinder"
 
@@ -75,6 +82,8 @@ FIELDNAMES = [
     "export_timestamp_utc",
     "openstack_volume_uuid",
     "pure_volume_name",
+    "pure_array_name",
+    "pure_name_source",
     "volume_display_name",
     "volume_description",
     "volume_status",
@@ -90,42 +99,66 @@ FIELDNAMES = [
 ]
 
 
-def pure_volume_name(volume_uuid):
-    """Return the FlashArray volume name the Pure Cinder driver would assign.
+# A Pure backing volume name looks like 'volume-<uuid>-cinder', optionally
+# carrying a Purity pod/volume-group scope prefix ('mypod::volume-...').
+PURE_NAME_RE = re.compile(
+    r"(?:[^\s:/]+::)?volume-[0-9a-fA-F-]{36}-cinder\Z"
+)
 
-    Mirrors the driver's naming convention: volume-<uuid>-cinder.
+
+def _volume_metadata(volume):
+    """Return the volume's user metadata as a dict (empty if none)."""
+    meta = getattr(volume, "metadata", None)
+    return meta if isinstance(meta, dict) else {}
+
+
+def resolve_pure_volume_name(volume):
+    """Return (pure_volume_name, source) by reading the true array volume name
+    directly from volume metadata.
+
+    The Pure driver records the real backing-volume name in metadata under
+    'array_volume_name'. This is read verbatim. The name is deliberately NOT
+    constructed from the OpenStack volume id: after a migration or retype the
+    backing name diverges from volume-<id>-cinder, so a constructed value would
+    be incorrect. If the field is absent, that is reported (empty name with a
+    'missing-metadata' source) so it can be investigated rather than masked by
+    a fabricated value.
     """
-    return "{0}{1}{2}".format(PURE_NAME_PREFIX, volume_uuid, PURE_NAME_SUFFIX)
+    value = _volume_metadata(volume).get(PURE_NAME_METADATA_KEY)
+    if value:
+        return value, "metadata:{0}".format(PURE_NAME_METADATA_KEY)
+    return "", "missing-metadata"
+
+
+def pure_array_name(volume):
+    """Return the FlashArray name the volume resides on, read from metadata.
+
+    Empty string if not recorded. Important in multi-backend deployments to
+    disambiguate which array a given volume name belongs to.
+    """
+    return _volume_metadata(volume).get(PURE_ARRAY_METADATA_KEY, "") or ""
 
 
 def uuid_from_pure_name(array_volume_name):
-    """Reverse of pure_volume_name(): extract the OpenStack UUID from a Pure
-    volume name. Returns None if the name does not match the driver pattern.
+    """Parse the embedded UUID out of a Pure volume name. Returns None if the
+    name does not match the driver pattern.
 
     Useful during recovery when starting from an orphaned array volume name.
     Handles names that may carry a pod/vgroup prefix such as 'mypod::volume-...'
     by isolating the final path component first.
+
+    Note: for a migrated/retyped volume the embedded UUID is the volume's
+    name_id, NOT its user-facing OpenStack id. To map an array name back to the
+    OpenStack volume, match it against the 'pure_volume_name' column of an
+    export rather than relying on the embedded UUID.
     """
     if not array_volume_name:
         return None
     # Strip any Purity pod or volume-group scope prefix ("pod::" / "vgroup/").
     name = array_volume_name.split("::")[-1].split("/")[-1]
     if name.startswith(PURE_NAME_PREFIX) and name.endswith(PURE_NAME_SUFFIX):
-        uuid = name[len(PURE_NAME_PREFIX):-len(PURE_NAME_SUFFIX)]
-        # Reject a name with an empty UUID body ("volume--cinder").
-        return uuid or None
+        return name[len(PURE_NAME_PREFIX):-len(PURE_NAME_SUFFIX)]
     return None
-
-
-def _str_attr(volume, attr):
-    """Read an attribute as a string, distinguishing 'absent' from a falsy
-    value. Returns "" only when the attribute is missing or None; preserves
-    False / 0 so that, e.g., a non-bootable volume records 'False' not ''.
-    """
-    value = getattr(volume, attr, None)
-    if value is None:
-        return ""
-    return value
 
 
 def connect(cloud_name):
@@ -136,11 +169,9 @@ def connect(cloud_name):
         else:
             conn = openstack.connect()
         # Touch the token early so auth failures surface here, not mid-run.
-        # Auth failures raise keystoneauth1 exceptions, which do NOT subclass
-        # os_exc.SDKException, so catch broadly to log a useful message.
         conn.authorize()
         return conn
-    except Exception as exc:
+    except os_exc.SDKException as exc:
         LOG.error("Failed to connect/authenticate to OpenStack: %s", exc)
         raise
 
@@ -223,23 +254,26 @@ def collect_rows(conn, all_projects):
     for vol in volumes:
         instance_uuid, device = extract_attachment(vol)
         instance_name = resolve_server_name(conn, instance_uuid, server_cache)
+        pure_name, name_source = resolve_pure_volume_name(vol)
 
         rows.append({
             "export_timestamp_utc": now_iso,
             "openstack_volume_uuid": vol.id,
-            "pure_volume_name": pure_volume_name(vol.id),
-            "volume_display_name": _str_attr(vol, "name"),
-            "volume_description": _str_attr(vol, "description"),
-            "volume_status": _str_attr(vol, "status"),
-            "volume_size_gb": _str_attr(vol, "size"),
-            "volume_type": _str_attr(vol, "volume_type"),
-            "bootable": _str_attr(vol, "is_bootable"),
+            "pure_volume_name": pure_name,
+            "pure_array_name": pure_array_name(vol),
+            "pure_name_source": name_source,
+            "volume_display_name": getattr(vol, "name", "") or "",
+            "volume_description": getattr(vol, "description", "") or "",
+            "volume_status": getattr(vol, "status", "") or "",
+            "volume_size_gb": getattr(vol, "size", "") or "",
+            "volume_type": getattr(vol, "volume_type", "") or "",
+            "bootable": getattr(vol, "is_bootable", "") or "",
             "project_id": project_id_of(vol),
             "attached_instance_uuid": instance_uuid,
             "attached_instance_name": instance_name,
             "attached_device": device,
-            "availability_zone": _str_attr(vol, "availability_zone"),
-            "created_at": _str_attr(vol, "created_at"),
+            "availability_zone": getattr(vol, "availability_zone", "") or "",
+            "created_at": getattr(vol, "created_at", "") or "",
         })
 
     LOG.info("Collected correlation data for %d volume(s).", len(rows))
@@ -375,11 +409,7 @@ def main(argv=None):
         write_outputs(rows, args.output_dir)
         prune_old_exports(args.output_dir, args.retention_days)
     except os_exc.SDKException as exc:
-        LOG.error("Export failed (OpenStack error): %s", exc)
-        return 1
-    except OSError as exc:
-        # makedirs/open/symlink failures (e.g. output dir not writable).
-        LOG.error("Export failed (filesystem error): %s", exc)
+        LOG.error("Export failed: %s", exc)
         return 1
     finally:
         try:
@@ -392,4 +422,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-
