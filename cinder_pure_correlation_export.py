@@ -15,6 +15,23 @@
 # captures the human-meaningful context (VM name, owner, display name) BEFORE
 # deletion and retains it outside OpenStack, bridging the recovery gap.
 #
+# For volume-backed instances (where the root disk is also a volume), the
+# attachment layout matters for recovery: the disks must be re-attached in the
+# correct order and the boot volume identified correctly. This script therefore
+# captures every attachment per volume, the device path (which encodes disk
+# order), and a boot-volume marker derived from the instance's root_device_name
+# (authoritative) or, when that is unavailable, a clearly-labelled heuristic.
+#
+# OUTPUTS (written to --output-dir each run, timestamped, with 'latest' links):
+#   volume_correlation_<ts>.csv             one row per volume (flat)
+#   volume_correlation_<ts>.json            one record per volume (full detail)
+#   volume_correlation_by_instance_<ts>.json
+#                                           per-instance recovery view: each
+#                                           instance's disks ordered by device,
+#                                           boot volume flagged - use this to
+#                                           rebuild a VM with the correct disk
+#                                           order.
+#
 # The script is READ-ONLY against OpenStack. It performs no mutating calls.
 #
 # Author: Simon Dodsley, Everpure
@@ -94,6 +111,10 @@ FIELDNAMES = [
     "attached_instance_uuid",
     "attached_instance_name",
     "attached_device",
+    "is_boot_volume",
+    "instance_root_device",
+    "attachment_count",
+    "all_attachments",
     "availability_zone",
     "created_at",
 ]
@@ -176,55 +197,84 @@ def connect(cloud_name):
         raise
 
 
-def build_server_name_cache(conn, all_projects):
-    """Pre-fetch server UUID -> name to avoid a per-volume compute lookup.
+def get_server_info(conn, server_id, cache):
+    """Return {'name', 'root_device'} for an instance, cached per server.
 
-    Returns a dict keyed by server UUID. Falls back gracefully if the compute
-    listing is not permitted; individual lookups will then be attempted later.
+    root_device is the instance's root_device_name (e.g. '/dev/vda'), which is
+    the authoritative way to identify the boot volume: the attachment whose
+    device matches it is the boot disk. Resolved defensively, since it is an
+    admin-only attribute exposed under varying keys; empty if unavailable.
     """
-    cache = {}
-    try:
-        for server in conn.compute.servers(
-            details=False, all_projects=all_projects
-        ):
-            cache[server.id] = server.name
-        LOG.info("Cached %d server name(s).", len(cache))
-    except os_exc.SDKException as exc:
-        LOG.warning(
-            "Could not bulk-list servers (%s). Will resolve names "
-            "individually where possible.", exc
-        )
-    return cache
-
-
-def resolve_server_name(conn, server_id, cache):
-    """Resolve an instance UUID to its name, using and updating the cache."""
     if not server_id:
-        return ""
+        return {"name": "", "root_device": ""}
     if server_id in cache:
         return cache[server_id]
+
+    info = {"name": "", "root_device": ""}
     try:
         server = conn.compute.get_server(server_id)
-        cache[server_id] = server.name
-        return server.name
+        info["name"] = getattr(server, "name", "") or ""
+        root = getattr(server, "root_device_name", None)
+        if not root:
+            try:
+                raw = server.to_dict()
+            except Exception:
+                raw = {}
+            for key, value in raw.items():
+                if value and key.split(":")[-1] == "root_device_name":
+                    root = value
+                    break
+        info["root_device"] = root or ""
     except os_exc.SDKException:
-        # Instance may already be gone; the UUID is still recorded.
-        cache[server_id] = ""
-        return ""
+        # Instance may already be gone; identifiers from the volume remain.
+        pass
+
+    cache[server_id] = info
+    return info
 
 
-def extract_attachment(volume):
-    """Return (instance_uuid, device) for the first attachment, or ('', '').
+def extract_attachments(volume):
+    """Return a list of attachment dicts for the volume, each with keys
+    'server_id', 'device', and 'attachment_id'. Empty list if unattached.
 
-    Cinder volumes may have multiple attachments (multi-attach); the first is
-    sufficient for correlation. Extend here if multi-attach detail is needed.
+    Captures ALL attachments (a volume may be multi-attached), preserving the
+    device path which encodes the disk's position on the instance.
     """
-    attachments = getattr(volume, "attachments", None) or []
-    if not attachments:
-        return "", ""
-    first = attachments[0]
-    # openstacksdk returns attachment dicts with 'server_id' and 'device'.
-    return first.get("server_id", "") or "", first.get("device", "") or ""
+    result = []
+    for att in (getattr(volume, "attachments", None) or []):
+        result.append({
+            "server_id": att.get("server_id", "") or "",
+            "device": att.get("device", "") or "",
+            "attachment_id": att.get("attachment_id", "") or att.get("id", "") or "",
+        })
+    return result
+
+
+def _device_sort_key(device):
+    """Sort key that orders device paths by length then lexically, so
+    /dev/vda < /dev/vdb < ... < /dev/vdz < /dev/vdaa rather than the naive
+    lexical ordering that would misplace multi-letter suffixes.
+    """
+    return (len(device), device)
+
+
+def classify_boot(device, root_device, volume_bootable):
+    """Return one of 'yes', 'no', 'heuristic', 'unknown' for whether this
+    attachment is the instance's boot disk.
+
+    Authoritative when the instance root_device_name is known: an exact device
+    match is the boot disk. When it is not known, fall back to a clearly
+    labelled heuristic based on the conventional first-disk device names and
+    the volume's bootable flag.
+    """
+    if root_device:
+        return "yes" if device == root_device else "no"
+    base = (device or "").rsplit("/", 1)[-1]
+    if base in ("vda", "sda", "xvda", "hda") and volume_bootable:
+        return "heuristic"
+    if not volume_bootable:
+        return "no"
+    return "unknown"
 
 
 def project_id_of(volume):
@@ -245,16 +295,50 @@ def project_id_of(volume):
 def collect_rows(conn, all_projects):
     """Walk all Cinder volumes and build the correlation rows."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    server_cache = build_server_name_cache(conn, all_projects)
+    server_cache = {}
     rows = []
 
     volumes = conn.block_storage.volumes(
         details=True, all_projects=all_projects
     )
     for vol in volumes:
-        instance_uuid, device = extract_attachment(vol)
-        instance_name = resolve_server_name(conn, instance_uuid, server_cache)
         pure_name, name_source = resolve_pure_volume_name(vol)
+        bootable = bool(getattr(vol, "is_bootable", False))
+
+        # Enrich every attachment with the resolved instance name, the
+        # instance's root device, and a boot classification.
+        attachments = extract_attachments(vol)
+        enriched = []
+        for att in attachments:
+            sinfo = get_server_info(conn, att["server_id"], server_cache)
+            enriched.append({
+                "server_id": att["server_id"],
+                "instance_name": sinfo["name"],
+                "device": att["device"],
+                "attachment_id": att["attachment_id"],
+                "instance_root_device": sinfo["root_device"],
+                "is_boot": classify_boot(
+                    att["device"], sinfo["root_device"], bootable
+                ),
+            })
+
+        # Primary attachment fields (first attachment) kept for the flat view.
+        primary = enriched[0] if enriched else {
+            "server_id": "", "instance_name": "", "device": "",
+            "instance_root_device": "", "is_boot": "no",
+        }
+        # A volume is a boot volume if any of its attachments is the boot disk.
+        boot_flags = [a["is_boot"] for a in enriched]
+        if "yes" in boot_flags:
+            is_boot_volume = "yes"
+        elif "heuristic" in boot_flags:
+            is_boot_volume = "heuristic"
+        elif enriched and all(f == "no" for f in boot_flags):
+            is_boot_volume = "no"
+        elif enriched:
+            is_boot_volume = "unknown"
+        else:
+            is_boot_volume = ""  # unattached
 
         rows.append({
             "export_timestamp_utc": now_iso,
@@ -267,11 +351,15 @@ def collect_rows(conn, all_projects):
             "volume_status": getattr(vol, "status", "") or "",
             "volume_size_gb": getattr(vol, "size", "") or "",
             "volume_type": getattr(vol, "volume_type", "") or "",
-            "bootable": getattr(vol, "is_bootable", "") or "",
+            "bootable": bootable,
             "project_id": project_id_of(vol),
-            "attached_instance_uuid": instance_uuid,
-            "attached_instance_name": instance_name,
-            "attached_device": device,
+            "attached_instance_uuid": primary["server_id"],
+            "attached_instance_name": primary["instance_name"],
+            "attached_device": primary["device"],
+            "is_boot_volume": is_boot_volume,
+            "instance_root_device": primary["instance_root_device"],
+            "attachment_count": len(enriched),
+            "all_attachments": enriched,
             "availability_zone": getattr(vol, "availability_zone", "") or "",
             "created_at": getattr(vol, "created_at", "") or "",
         })
@@ -280,27 +368,80 @@ def collect_rows(conn, all_projects):
     return rows
 
 
+def build_instance_view(rows):
+    """Pivot the per-volume rows into a per-instance recovery view.
+
+    Returns a list of instances, each with its disks ordered by device path
+    and the boot volume flagged, so a volume-backed VM can be rebuilt with the
+    correct disk attachment order. Volumes with no attachment are skipped here
+    (they still appear in the per-volume export).
+    """
+    instances = {}
+    for row in rows:
+        for att in row["all_attachments"]:
+            sid = att["server_id"]
+            if not sid:
+                continue
+            inst = instances.setdefault(sid, {
+                "instance_uuid": sid,
+                "instance_name": att["instance_name"],
+                "instance_root_device": att["instance_root_device"],
+                "disks": [],
+            })
+            inst["disks"].append({
+                "device": att["device"],
+                "is_boot": att["is_boot"],
+                "openstack_volume_uuid": row["openstack_volume_uuid"],
+                "pure_volume_name": row["pure_volume_name"],
+                "pure_array_name": row["pure_array_name"],
+                "volume_size_gb": row["volume_size_gb"],
+                "volume_display_name": row["volume_display_name"],
+            })
+
+    for inst in instances.values():
+        inst["disks"].sort(key=lambda d: _device_sort_key(d["device"]))
+
+    return sorted(instances.values(), key=lambda i: i["instance_name"] or i["instance_uuid"])
+
+
 def write_outputs(rows, output_dir):
-    """Write timestamped CSV and JSON exports. Returns (csv_path, json_path)."""
+    """Write timestamped exports: a per-volume CSV and JSON, plus a per-instance
+    recovery view (JSON) grouping disks by instance in attachment order.
+    Returns (csv_path, json_path, instance_json_path).
+    """
     os.makedirs(output_dir, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     csv_path = os.path.join(output_dir, "volume_correlation_{0}.csv".format(stamp))
     json_path = os.path.join(output_dir, "volume_correlation_{0}.json".format(stamp))
+    instance_json_path = os.path.join(
+        output_dir, "volume_correlation_by_instance_{0}.json".format(stamp)
+    )
 
+    # CSV cannot hold nested structures; serialise list/dict cells to a JSON
+    # string so the per-attachment detail survives in flattened form.
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            flat = {
+                k: (json.dumps(v, separators=(",", ":"))
+                    if isinstance(v, (list, dict)) else v)
+                for k, v in row.items()
+            }
+            writer.writerow(flat)
 
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(rows, fh, indent=2, sort_keys=False)
 
-    # Maintain a stable "latest" symlink for convenience.
+    with open(instance_json_path, "w", encoding="utf-8") as fh:
+        json.dump(build_instance_view(rows), fh, indent=2, sort_keys=False)
+
+    # Maintain stable "latest" symlinks for convenience.
     for target, link_name in (
         (csv_path, "volume_correlation_latest.csv"),
         (json_path, "volume_correlation_latest.json"),
+        (instance_json_path, "volume_correlation_by_instance_latest.json"),
     ):
         link_path = os.path.join(output_dir, link_name)
         try:
@@ -310,8 +451,8 @@ def write_outputs(rows, output_dir):
         except OSError as exc:
             LOG.warning("Could not update symlink %s: %s", link_path, exc)
 
-    LOG.info("Wrote %s and %s", csv_path, json_path)
-    return csv_path, json_path
+    LOG.info("Wrote %s, %s and %s", csv_path, json_path, instance_json_path)
+    return csv_path, json_path, instance_json_path
 
 
 def prune_old_exports(output_dir, retention_days):
